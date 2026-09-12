@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useMemo, useState } from 'react'
-import { signIn, signOut, useSession } from 'next-auth/react'
+import { signOut } from 'next-auth/react'
 import {
   Activity,
   AlertTriangle,
@@ -86,6 +86,7 @@ type BackendMetrics = {
   source_mode?: 'idle' | 'fixture' | 'live'
   data_provenance: 'none' | 'synthetic_fixture' | 'authorized_live_metadata'
   interface?: string | null
+  bpf_filter?: string | null
   status: string
   running: boolean
   started_at: number | null
@@ -95,6 +96,13 @@ type BackendMetrics = {
   model_status: { available: boolean; version: string }
   appwrite_status: { enabled: boolean; persisted_count: number; last_error: string | null }
   ollama_status: { enabled: boolean; model: string; available: boolean }
+  capture_stats?: {
+    packets_seen: number
+    flows_emitted: number
+    dropped_packets: number
+    error_count: number
+    last_error: string | null
+  }
   incidents_generated?: number
   last_error?: string
 }
@@ -121,22 +129,39 @@ type SocketMessage =
 
 type SeverityFilter = 'all' | Severity
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL ?? 'http://127.0.0.1:8000'
+const CONFIGURED_API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL
+const API_TOKEN = process.env.NEXT_PUBLIC_DETECTOR_API_TOKEN
 const tabs: Tab[] = ['Overview', 'Alerts', 'Analytics', 'About']
 const replaySpeeds: ReplaySpeed[] = [0.5, 1, 2, 4]
 
+function apiBase() {
+  if (CONFIGURED_API_BASE) {
+    return CONFIGURED_API_BASE.replace(/\/(?:ws\/alerts|api)\/?$/, '').replace(/\/$/, '')
+  }
+  if (typeof window === 'undefined') return 'http://127.0.0.1:8000'
+
+  const hostname = window.location.hostname.replace('-5173.', '-8000.')
+  return `${window.location.protocol}//${hostname}:8000`
+}
+
 function apiUrl(path: string) {
-  return `${API_BASE}${path}`
+  return `${apiBase()}${path}`
 }
 
 function wsUrl() {
-  return API_BASE.replace(/^http/, 'ws')
+  const base = apiBase().replace(/^http/, 'ws')
+  return API_TOKEN ? `${base}/ws/alerts?access_token=${encodeURIComponent(API_TOKEN)}` : `${base}/ws/alerts`
+}
+
+function authHeaders(): Record<string, string> {
+  return API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : {}
 }
 
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiUrl(path), {
     headers: {
       'Content-Type': 'application/json',
+      ...authHeaders(),
       ...(init?.headers ?? {}),
     },
     ...init,
@@ -385,17 +410,12 @@ function Header({
   )
 }
 
-function LoginScreen() {
+function LoginScreen({ onContinue }: { onContinue: () => void }) {
   const [isSigningIn, setIsSigningIn] = useState(false)
 
-  const handleGoogleSignIn = async () => {
+  const handleGoogleSignIn = () => {
     setIsSigningIn(true)
-    try {
-      await signIn('google', { callbackUrl: '/' })
-    } catch (error) {
-      console.error('Google sign-in error:', error)
-      setIsSigningIn(false)
-    }
+    onContinue()
   }
 
   return (
@@ -493,6 +513,9 @@ function ReplayControls({
   onStop,
   liveInterface,
   setLiveInterface,
+  liveInterfaces,
+  liveBpfFilter,
+  setLiveBpfFilter,
   onStartLive,
   status,
 }: {
@@ -506,6 +529,9 @@ function ReplayControls({
   onStop: () => void
   liveInterface: string
   setLiveInterface: (value: string) => void
+  liveInterfaces: string[]
+  liveBpfFilter: string
+  setLiveBpfFilter: (value: string) => void
   onStartLive: () => void
   status: BackendMetrics | null
 }) {
@@ -556,10 +582,24 @@ function ReplayControls({
         <label>
           LIVE INTERFACE
           <input
+            list="capture-interfaces"
             value={liveInterface}
             onChange={event => setLiveInterface(event.target.value)}
             placeholder="default interface"
             aria-label="Live capture interface"
+          />
+          <datalist id="capture-interfaces">
+            {liveInterfaces.map(interfaceName => <option key={interfaceName} value={interfaceName} />)}
+          </datalist>
+        </label>
+
+        <label>
+          BPF FILTER
+          <input
+            value={liveBpfFilter}
+            onChange={event => setLiveBpfFilter(event.target.value)}
+            placeholder="ip or ip6"
+            aria-label="Live capture BPF filter"
           />
         </label>
 
@@ -580,6 +620,11 @@ function ReplayControls({
               ? 'Replay error'
               : 'Replay engine idle'}
         <span className="replay-id">SOURCE / {status?.source_mode?.toUpperCase() ?? 'IDLE'}</span>
+        {status?.source_mode === 'live' && status.capture_stats && (
+          <span className="replay-id">
+            PACKETS / {status.capture_stats.packets_seen} · FLOWS / {status.capture_stats.flows_emitted} · DROPPED / {status.capture_stats.dropped_packets}
+          </span>
+        )}
       </div>
     </section>
   )
@@ -1174,7 +1219,7 @@ function About({ metrics }: { metrics: BackendMetrics | null }) {
           </div>
           <Terminal size={17} className="muted" />
         </div>
-        <pre>{`POST ${API_BASE}/api/replay/start
+        <pre>{`POST ${apiBase()}/api/replay/start
 {
   "scenario": "syn_flood",
   "speed": 1
@@ -1185,13 +1230,16 @@ function About({ metrics }: { metrics: BackendMetrics | null }) {
 }
 
 function App() {
-  const { data: session, status: authStatus } = useSession()
+  const session = null
+  const [demoAccess, setDemoAccess] = useState(false)
   const [tab, setTab] = useState<Tab>('Overview')
   const [metrics, setMetrics] = useState<BackendMetrics | null>(null)
   const [scenarios, setScenarios] = useState<string[]>([])
   const [selectedScenario, setSelectedScenario] = useState('')
   const [speed, setSpeed] = useState<ReplaySpeed>(1)
   const [liveInterface, setLiveInterface] = useState('')
+  const [liveInterfaces, setLiveInterfaces] = useState<string[]>([])
+  const [liveBpfFilter, setLiveBpfFilter] = useState('ip or ip6')
   const [alerts, setAlerts] = useState<AlertView[]>([])
   const [incidents, setIncidents] = useState<BackendIncident[]>([])
   const [selected, setSelected] = useState<AlertView | null>(null)
@@ -1214,11 +1262,12 @@ function App() {
 
     async function load() {
       try {
-        const [scenarioResponse, metricsResponse, alertResponse, incidentResponse] = await Promise.all([
+        const [scenarioResponse, metricsResponse, alertResponse, incidentResponse, interfaceResponse] = await Promise.all([
           requestJson<{ scenarios: string[] }>('/api/scenarios'),
           requestJson<BackendMetrics>('/api/metrics'),
           requestJson<{ alerts: BackendAlert[] }>('/api/alerts?limit=100'),
           requestJson<{ incidents: BackendIncident[] }>('/api/incidents?limit=100'),
+          requestJson<{ interfaces: string[] }>('/api/live/interfaces'),
         ])
 
         if (cancelled) return
@@ -1227,6 +1276,7 @@ function App() {
         setMetrics(metricsResponse)
         setAlerts(alertResponse.alerts.map(normalizeAlert))
         setIncidents(incidentResponse.incidents)
+        setLiveInterfaces(interfaceResponse.interfaces)
         setSelectedScenario(metricsResponse.scenario ?? scenarioResponse.scenarios[0] ?? '')
         setConnectionState('connected')
       } catch (error) {
@@ -1244,7 +1294,7 @@ function App() {
   }, [])
 
   useEffect(() => {
-    const socket = new WebSocket(`${wsUrl()}/ws/alerts`)
+    const socket = new WebSocket(wsUrl())
 
     socket.onopen = () => setConnectionState('connected')
     socket.onerror = () => setConnectionState('error')
@@ -1330,7 +1380,7 @@ function App() {
     try {
       await requestJson('/api/live/start', {
         method: 'POST',
-        body: JSON.stringify({ interface: liveInterface || null }),
+        body: JSON.stringify({ interface: liveInterface || null, bpf_filter: liveBpfFilter }),
       })
       setMetrics(current =>
         current
@@ -1386,6 +1436,9 @@ function App() {
           onStop={() => void handleStop()}
           liveInterface={liveInterface}
           setLiveInterface={setLiveInterface}
+          liveInterfaces={liveInterfaces}
+          liveBpfFilter={liveBpfFilter}
+          setLiveBpfFilter={setLiveBpfFilter}
           onStartLive={() => void handleStartLive()}
           status={metrics}
         />
@@ -1408,33 +1461,14 @@ function App() {
     )
   }, [alerts, handleStart, handleStop, incidents, metrics, selectedScenario, speed, tab, scenarios])
 
-  if (authStatus === 'loading') {
-    return (
-      <main className="login-screen" suppressHydrationWarning>
-        <div className="login-grid" />
-        <div className="login-glow" />
-        <section className="login-card" style={{ textAlign: 'center', padding: '48px 32px' }} suppressHydrationWarning>
-          <div className="login-brand" style={{ justifyContent: 'center' }}>
-            <Logo />
-            <span>SIH<span className="cyan">26145</span></span>
-          </div>
-          <div className="eyebrow" style={{ marginTop: '20px' }}>INITIALIZING SECURITY CONSOLE</div>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '10px', marginTop: '24px', color: '#22d3ee', fontFamily: 'monospace', fontSize: '12px' }}>
-            <span className="live-pulse on" /> VERIFYING OPERATOR CREDENTIALS...
-          </div>
-        </section>
-      </main>
-    )
-  }
-
-  if (!session) {
-    return <LoginScreen />
+  if (!session && !demoAccess) {
+    return <LoginScreen onContinue={() => setDemoAccess(true)} />
   }
 
   return (
     <main className="app-shell">
       <div className="background-grid" />
-      <Header tab={tab} setTab={setTab} status={metrics} onLogout={() => void handleLogout()} userEmail={session.user?.email} />
+      <Header tab={tab} setTab={setTab} status={metrics} onLogout={() => void handleLogout()} userEmail="local operator" />
 
       <div className="page-content">
         <div className="page-intro">

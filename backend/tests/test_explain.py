@@ -82,3 +82,58 @@ def test_check_ollama_returns_false_when_unreachable(monkeypatch) -> None:
 
     monkeypatch.setattr(httpx, "AsyncClient", FailingClient)
     assert asyncio.run(check_ollama(timeout_seconds=0.1)) is False
+
+
+def test_check_ollama_requires_configured_model(monkeypatch) -> None:
+    class EmptyTagsClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def get(self, *args, **kwargs):
+            class Response:
+                status_code = 200
+
+                def json(self):
+                    return {"models": []}
+
+            return Response()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", EmptyTagsClient)
+    assert asyncio.run(check_ollama(model="qwen2.5:3b-instruct")) is False
+
+
+def test_generate_explanation_uses_ollama_response(monkeypatch) -> None:
+    class WorkingClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args) -> None:
+            return None
+
+        async def post(self, *args, **kwargs):
+            class Response:
+                def raise_for_status(self) -> None:
+                    return None
+
+                def json(self):
+                    return {"response": "The traffic shows a high-confidence SYN flood."}
+
+            return Response()
+
+    import httpx
+
+    monkeypatch.setattr(httpx, "AsyncClient", WorkingClient)
+    result = asyncio.run(generate_explanation(sample_alert(), timeout_seconds=0.1))
+    assert result.source == "ollama"
+    assert result.explanation == "The traffic shows a high-confidence SYN flood."

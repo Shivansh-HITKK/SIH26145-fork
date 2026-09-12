@@ -7,8 +7,10 @@ all features are still computed from metadata-only ``FlowEvent`` records.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import random
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -287,6 +289,17 @@ FIXTURE_LABELS = {
 }
 
 
+FEATURE_SCHEMA_VERSION = "window-features-v1"
+
+
+def _file_sha256(path: str | Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def build_bootstrap_dataset(output_path: str | Path, per_class: int = 50, seed: int = 42) -> dict[str, object]:
     """Write a labeled bootstrap dataset from the deterministic scenario generators.
 
@@ -304,7 +317,12 @@ def build_bootstrap_dataset(output_path: str | Path, per_class: int = 50, seed: 
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text("\n".join(rows) + "\n", encoding="utf-8")
-    return {"output_path": str(output), "windows": len(rows), "source": "fixture_bootstrap"}
+    return {
+        "output_path": str(output),
+        "windows": len(rows),
+        "source": "fixture_bootstrap",
+        "sha256": _file_sha256(output),
+    }
 
 
 def generate_dataset(per_class: int = 200, seed: int = 42) -> tuple[list[list[float]], list[str]]:
@@ -393,6 +411,11 @@ def train_and_save(
         "version": "ml-v1",
         "class_labels": CLASS_LABELS,
         "feature_names": FEATURE_NAMES,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
+        "training_source": "synthetic_generator",
+        "training_mode": "synthetic_scenario_separated",
+        "dataset_sha256": None,
+        "dataset_rows": per_class * len(CLASS_LABELS),
         "samples_per_class": per_class,
         "eval_samples_per_class": eval_per_class,
         "seed": seed,
@@ -414,7 +437,7 @@ def train_and_save(
     }
 
 
-def _load_labeled_windows(path: str | Path) -> tuple[list[list[float]], list[str]]:
+def _load_labeled_windows(path: str | Path) -> tuple[list[list[float]], list[str], dict[str, object]]:
     """Load real labeled windows from JSONL without accepting raw payloads.
 
     Each line must contain ``{"label": "...", "events": [{...}]}``, where
@@ -422,6 +445,10 @@ def _load_labeled_windows(path: str | Path) -> tuple[list[list[float]], list[str
     """
     vectors: list[list[float]] = []
     labels: list[str] = []
+    groups: list[str] = []
+    event_count = 0
+    label_counts: Counter[str] = Counter()
+    explicit_groups = False
     allowed = set(SAMPLE_GENERATORS)
     with Path(path).open(encoding="utf-8") as source:
         for line_number, line in enumerate(source, start=1):
@@ -431,16 +458,29 @@ def _load_labeled_windows(path: str | Path) -> tuple[list[list[float]], list[str
                 row = json.loads(line)
                 label = str(row["label"])
                 events = [FlowEvent.model_validate(item) for item in row["events"]]
+                group_value = row.get("capture_id") or row.get("source_capture")
+                group = str(group_value) if group_value else f"row:{line_number}"
+                explicit_groups = explicit_groups or bool(group_value)
                 if label not in allowed or not events:
                     raise ValueError("label must be a supported class and events must be non-empty")
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 raise ValueError(f"Invalid labeled window at {path}:{line_number}: {exc}") from exc
             features = extract_window_features(events, window_seconds=30.0)
             vectors.append([float(features.model_dump()[name]) for name in FEATURE_NAMES])
             labels.append(label)
+            groups.append(group)
+            event_count += len(events)
+            label_counts[label] += 1
     if len(set(labels)) < 2:
         raise ValueError("At least two labeled classes are required for supervised training")
-    return vectors, labels
+    return vectors, labels, {
+        "rows": len(labels),
+        "events": event_count,
+        "label_counts": dict(sorted(label_counts.items())),
+        "groups": groups,
+        "group_count": len(set(groups)),
+        "explicit_groups": explicit_groups,
+    }
 
 
 def train_from_labeled_jsonl(
@@ -459,22 +499,38 @@ def train_from_labeled_jsonl(
             "scikit-learn is not installed. Install it with: python -m pip install -e 'backend[ml]'"
         ) from exc
 
-    vectors, labels = _load_labeled_windows(input_path)
+    vectors, labels, dataset_stats = _load_labeled_windows(input_path)
+    if not 0 < test_size < 1:
+        raise ValueError("test_size must be between 0 and 1")
     # Keep the final windows of each class out of training. This is less
     # optimistic than randomly splitting adjacent flows from the same capture.
     train_vectors: list[list[float]] = []
     test_vectors: list[list[float]] = []
     train_labels: list[str] = []
     test_labels: list[str] = []
+    groups = dataset_stats["groups"]
+    assert isinstance(groups, list)
+    use_capture_groups = bool(dataset_stats["explicit_groups"])
     for label in sorted(set(labels)):
-        class_vectors = [vector for vector, item_label in zip(vectors, labels) if item_label == label]
-        holdout = max(1, int(len(class_vectors) * test_size))
-        if len(class_vectors) - holdout < 1:
-            raise ValueError(f"Class {label!r} needs at least two labeled windows")
-        train_vectors.extend(class_vectors[:-holdout])
-        train_labels.extend([label] * (len(class_vectors) - holdout))
-        test_vectors.extend(class_vectors[-holdout:])
-        test_labels.extend([label] * holdout)
+        class_indices = [index for index, item_label in enumerate(labels) if item_label == label]
+        if use_capture_groups:
+            class_groups = list(dict.fromkeys(groups[index] for index in class_indices))
+            holdout_groups = max(1, int(len(class_groups) * test_size))
+            if len(class_groups) - holdout_groups < 1:
+                raise ValueError(f"Class {label!r} needs at least two capture groups")
+            test_group_set = set(class_groups[-holdout_groups:])
+            train_indices = [index for index in class_indices if groups[index] not in test_group_set]
+            test_indices = [index for index in class_indices if groups[index] in test_group_set]
+        else:
+            holdout = max(1, int(len(class_indices) * test_size))
+            if len(class_indices) - holdout < 1:
+                raise ValueError(f"Class {label!r} needs at least two labeled windows")
+            train_indices = class_indices[:-holdout]
+            test_indices = class_indices[-holdout:]
+        train_vectors.extend(vectors[index] for index in train_indices)
+        train_labels.extend([label] * len(train_indices))
+        test_vectors.extend(vectors[index] for index in test_indices)
+        test_labels.extend([label] * len(test_indices))
     classifier = RandomForestClassifier(n_estimators=120, max_depth=16, random_state=seed, n_jobs=1)
     classifier.fit(train_vectors, train_labels)
     predictions = classifier.predict(test_vectors)
@@ -495,11 +551,19 @@ def train_from_labeled_jsonl(
         "version": version,
         "class_labels": sorted(set(labels)),
         "feature_names": FEATURE_NAMES,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "training_source": str(input_path),
         "training_mode": training_mode,
+        "dataset_sha256": _file_sha256(input_path),
+        "dataset_rows": dataset_stats["rows"],
+        "dataset_events": dataset_stats["events"],
+        "dataset_label_counts": dataset_stats["label_counts"],
+        "dataset_group_count": dataset_stats["group_count"],
         "seed": seed,
         "evaluation_accuracy": round(float(accuracy_score(test_labels, predictions)), 4),
-        "evaluation_method": "contiguous_per_class_holdout",
+        "evaluation_method": (
+            "capture_group_holdout" if use_capture_groups else "contiguous_per_class_holdout"
+        ),
     }
     (output_dir / "model_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     return {
@@ -509,6 +573,7 @@ def train_from_labeled_jsonl(
         "accuracy": meta["evaluation_accuracy"],
         "classification_report": classification_report(test_labels, predictions, zero_division=0),
         "version": meta["version"],
+        "dataset_sha256": meta["dataset_sha256"],
     }
 
 
@@ -552,9 +617,19 @@ def train_baseline_from_jsonl(
         "version": "ml-baseline-v1",
         "class_labels": CLASS_LABELS,
         "feature_names": FEATURE_NAMES,
+        "feature_schema_version": FEATURE_SCHEMA_VERSION,
         "training_source": str(input_path),
         "training_mode": "unlabeled_live_anomaly_baseline",
+        "dataset_sha256": _file_sha256(input_path),
+        "dataset_events": len(events),
+        "dataset_windows": len(vectors),
         "windows": len(vectors),
     }
     (output_dir / "model_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
-    return {"output_dir": str(output_dir), "trained_on": len(events), "windows": len(vectors), "version": meta["version"]}
+    return {
+        "output_dir": str(output_dir),
+        "trained_on": len(events),
+        "windows": len(vectors),
+        "version": meta["version"],
+        "dataset_sha256": meta["dataset_sha256"],
+    }

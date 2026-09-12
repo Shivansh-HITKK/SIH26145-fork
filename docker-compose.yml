@@ -1,23 +1,60 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    extra_hosts:
+      - "registry.ollama.ai:104.18.16.170"
+    volumes:
+      - ollama-models:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  ollama-model:
+    image: ollama/ollama:latest
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    extra_hosts:
+      - "registry.ollama.ai:104.18.16.170"
+    volumes:
+      - ollama-models:/root/.ollama
+    command: ["pull", "${OLLAMA_MODEL:-qwen2.5:3b-instruct}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+
   detector-api:
-    image: python:3.12-slim
-    working_dir: /workspace
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
     volumes:
       - .:/workspace
+      - detector-models:/workspace/models
     environment:
       APPWRITE_ENDPOINT: ${APPWRITE_ENDPOINT:-}
       APPWRITE_PROJECT_ID: ${APPWRITE_PROJECT_ID:-}
       APPWRITE_DATABASE_ID: ${APPWRITE_DATABASE_ID:-}
       APPWRITE_ALERTS_COLLECTION_ID: ${APPWRITE_ALERTS_COLLECTION_ID:-}
       APPWRITE_API_KEY: ${APPWRITE_API_KEY:-}
-      OLLAMA_URL: ${OLLAMA_URL:-http://127.0.0.1:11434}
+      DETECTOR_READ_TOKEN: ${DETECTOR_READ_TOKEN:-}
+      DETECTOR_CONTROL_TOKEN: ${DETECTOR_CONTROL_TOKEN:-}
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:3b-instruct}
       OLLAMA_TIMEOUT_SECONDS: ${OLLAMA_TIMEOUT_SECONDS:-45}
-    command: >-
-      sh -c "pip install -e 'backend[test]' &&
-      uvicorn sih_detector.api:app --app-dir backend/src --host 0.0.0.0 --port 8000"
+    command: uvicorn sih_detector.api:app --app-dir backend/src --host 0.0.0.0 --port 8000
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    depends_on:
+      ollama:
+        condition: service_started
 
   dashboard:
     image: node:22-slim
@@ -25,7 +62,8 @@ services:
     volumes:
       - .:/workspace
     environment:
-      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-http://127.0.0.1:8000}
+      NEXT_PUBLIC_API_BASE_URL: ${NEXT_PUBLIC_API_BASE_URL:-}
+      NEXT_PUBLIC_DETECTOR_API_TOKEN: ${NEXT_PUBLIC_DETECTOR_API_TOKEN:-}
       AUTH_SECRET: ${AUTH_SECRET:-local-development-secret-change-me}
       AUTH_URL: ${AUTH_URL:-http://localhost:5173}
       AUTH_GOOGLE_ID: ${AUTH_GOOGLE_ID:-}
@@ -35,3 +73,7 @@ services:
       - "5173:5173"
     depends_on:
       - detector-api
+
+volumes:
+  ollama-models:
+  detector-models:

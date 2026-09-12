@@ -26,7 +26,18 @@ The optional local LLM receives sanitized structured alerts only. It cannot chan
 
 ## Authentication and authorization
 
-Use Appwrite authentication and collection permissions. Dashboard users should only access the data intended for their project/demo environment.
+FastAPI supports optional bearer-token authorization for the local control plane.
+Keep `DETECTOR_CONTROL_TOKEN` server-side and use it only for trusted local
+operators; it can start/stop replay and live capture. `DETECTOR_READ_TOKEN`
+protects metrics, interfaces, alerts, incidents, and explanations. A control
+token also grants read access. Health remains public, and when neither token is
+configured the local development API remains open.
+
+The current browser dashboard can send `NEXT_PUBLIC_DETECTOR_API_TOKEN` for a
+single-user/local deployment. Do not expose a control token in a public or
+multi-user browser bundle. For production, place the dashboard behind a
+server-side proxy or session-aware gateway that keeps control credentials out
+of client JavaScript, and map authenticated user roles to read/control access.
 
 ## Auditability
 

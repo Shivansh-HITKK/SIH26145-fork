@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import threading
 import time
@@ -10,7 +11,7 @@ from typing import Any
 
 from collections.abc import AsyncIterator, Iterable
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -18,6 +19,7 @@ from .appwrite import AppwriteAlertSink
 from .detectors import DetectionConfig, WindowedDetector
 from .explain import check_ollama, generate_explanation
 from .incidents import IncidentAggregator
+from .live_capture import CaptureStats, list_interfaces
 from .model import load_scorer
 from .replay import read_events, replay
 from .schemas import Alert
@@ -36,6 +38,30 @@ class ReplayRequest(BaseModel):
 class LiveCaptureRequest(BaseModel):
     interface: str | None = Field(default=None, max_length=128)
     bpf_filter: str = Field(default="ip or ip6", min_length=1, max_length=512)
+
+
+def _bearer_token(authorization: str | None) -> str | None:
+    if not authorization:
+        return None
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    return token.strip()
+
+
+def _authorize(role: str, authorization: str | None) -> None:
+    read_token = os.getenv("DETECTOR_READ_TOKEN") or os.getenv("DETECTOR_API_TOKEN")
+    control_token = os.getenv("DETECTOR_CONTROL_TOKEN") or os.getenv("DETECTOR_API_TOKEN")
+    configured = read_token or control_token
+    if not configured:
+        return
+
+    supplied = _bearer_token(authorization)
+    if supplied is None:
+        raise HTTPException(status_code=401, detail="Bearer authentication is required")
+    accepted = control_token if role == "control" else read_token or control_token
+    if accepted is None or not hmac.compare_digest(supplied, accepted):
+        raise HTTPException(status_code=403, detail="Insufficient detector API permissions")
 
 
 class ReplayManager:
@@ -57,6 +83,7 @@ class ReplayManager:
         self.alerts: deque[Alert] = deque(maxlen=500)
         self.incidents = IncidentAggregator()
         self.appwrite_sink = AppwriteAlertSink()
+        self.capture_stats: CaptureStats | None = None
         self.ollama_status: dict[str, Any] = {
             "enabled": bool(os.getenv("OLLAMA_URL") or os.getenv("OLLAMA_MODEL")),
             "model": os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct"),
@@ -66,6 +93,7 @@ class ReplayManager:
 
     def reset_metrics(self) -> None:
         with self._lock:
+            self.capture_stats = None
             self.metrics: dict[str, Any] = {
                 "processed_events": 0,
                 "alerts_generated": 0,
@@ -85,6 +113,14 @@ class ReplayManager:
                 "appwrite_status": self.appwrite_sink.status(),
                 "ollama_status": self.ollama_status,
                 "incidents_generated": 0,
+                "bpf_filter": None,
+                "capture_stats": {
+                    "packets_seen": 0,
+                    "flows_emitted": 0,
+                    "dropped_packets": 0,
+                    "error_count": 0,
+                    "last_error": None,
+                },
             }
 
     def scenarios(self) -> list[str]:
@@ -101,6 +137,7 @@ class ReplayManager:
             raise FileNotFoundError(f"Unknown scenario: {scenario}")
 
         self._stop.clear()
+        _clear_pending_explanations()
         self.alerts.clear()
         self.incidents.clear()
         self.reset_metrics()
@@ -119,9 +156,11 @@ class ReplayManager:
         if self.is_running():
             raise RuntimeError("A replay or live capture is already running")
         self._stop.clear()
+        _clear_pending_explanations()
         self.alerts.clear()
         self.incidents.clear()
         self.reset_metrics()
+        self.capture_stats = CaptureStats()
         self.metrics.update(
             {
                 "scenario": None,
@@ -131,6 +170,8 @@ class ReplayManager:
                 "status": "running",
                 "running": True,
                 "started_at": time.time(),
+                "bpf_filter": bpf_filter,
+                "capture_stats": self.capture_stats.snapshot(),
             }
         )
         self._thread = threading.Thread(
@@ -166,7 +207,11 @@ class ReplayManager:
         try:
             from .live_capture import capture_events
 
-            self._run_events(capture_events(self._stop, interface, bpf_filter), 1.0, "live")
+            self._run_events(
+                capture_events(self._stop, interface, bpf_filter, stats=self.capture_stats),
+                1.0,
+                "live",
+            )
         except Exception as exc:
             with self._lock:
                 self.metrics["error_count"] += 1
@@ -195,6 +240,8 @@ class ReplayManager:
             processing_latency_ms = (time.perf_counter() - processing_started) * 1000
             with self._lock:
                 self.metrics["processed_events"] += 1
+                if source_mode == "live" and self.capture_stats is not None:
+                    self.metrics["capture_stats"] = self.capture_stats.snapshot()
                 processed = self.metrics["processed_events"]
                 previous_average = self.metrics["average_alert_latency_ms"]
                 self.metrics["average_alert_latency_ms"] = round(
@@ -230,6 +277,8 @@ class ReplayManager:
                 self.metrics["last_error"] = str(exc)
             status = "error"
         with self._lock:
+            if source_mode == "live" and self.capture_stats is not None:
+                self.metrics["capture_stats"] = self.capture_stats.snapshot()
             elapsed = max(time.perf_counter() - started, 0.001)
             self.metrics["events_per_second"] = round(self.metrics["processed_events"] / elapsed, 2)
             self.metrics["status"] = status
@@ -243,8 +292,8 @@ class ReplayManager:
 
     def _enqueue_explanation(self, alert: Alert) -> None:
         """Queue the alert for asynchronous explanation without blocking the replay."""
-        for loop, _queue in list(self._subscribers):
-            loop.call_soon_threadsafe(explanation_queue.put_nowait, alert)
+        if explanation_loop is not None:
+            explanation_loop.call_soon_threadsafe(_queue_explanation, alert)
 
     def _broadcast(self, message: dict[str, Any]) -> None:
         for loop, queue in list(self._subscribers):
@@ -263,6 +312,26 @@ class ReplayManager:
 
 
 explanation_queue: asyncio.Queue[Alert] = asyncio.Queue(maxsize=256)
+explanation_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _queue_explanation(alert: Alert) -> None:
+    try:
+        explanation_queue.put_nowait(alert)
+    except asyncio.QueueFull:
+        try:
+            explanation_queue.get_nowait()
+            explanation_queue.put_nowait(alert)
+        except asyncio.QueueEmpty:
+            pass
+
+
+def _clear_pending_explanations() -> None:
+    while True:
+        try:
+            explanation_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            return
 
 manager = ReplayManager()
 
@@ -278,7 +347,7 @@ app = FastAPI(title="SIH26145 Detection API", version="0.1.0", lifespan=lifespan
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
-    allow_origin_regex=r"https://[a-z0-9-]+-5173\.app\.github\.dev",
+    allow_origin_regex=r"https://(?:[a-z0-9-]+-5173\.app\.github\.dev|[a-z0-9-]+\.trycloudflare\.com)",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -287,33 +356,47 @@ app.add_middleware(
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "mode": "read_only_replay"}
+    return {"status": "ok", "mode": "read_only_capture_and_replay"}
 
 
 @app.get("/api/scenarios")
-def scenarios() -> dict[str, list[str]]:
+def scenarios(authorization: str | None = Header(default=None)) -> dict[str, list[str]]:
+    _authorize("read", authorization)
     return {"scenarios": manager.scenarios()}
 
 
+@app.get("/api/live/interfaces")
+def live_interfaces(authorization: str | None = Header(default=None)) -> dict[str, list[str]]:
+    _authorize("read", authorization)
+    return {"interfaces": list_interfaces()}
+
+
 @app.get("/api/metrics")
-def metrics() -> dict[str, Any]:
-    return manager.metrics
+def metrics(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    _authorize("read", authorization)
+    with manager._lock:
+        if manager.capture_stats is not None:
+            manager.metrics["capture_stats"] = manager.capture_stats.snapshot()
+        return dict(manager.metrics)
 
 
 @app.get("/api/alerts")
-def alerts(limit: int = 100) -> dict[str, list[dict[str, Any]]]:
+def alerts(limit: int = 100, authorization: str | None = Header(default=None)) -> dict[str, list[dict[str, Any]]]:
+    _authorize("read", authorization)
     bounded_limit = max(1, min(limit, 500))
     return {"alerts": [alert.model_dump(mode="json") for alert in list(manager.alerts)[:bounded_limit]]}
 
 
 @app.get("/api/incidents")
-def incidents(limit: int = 100) -> dict[str, list[dict[str, Any]]]:
+def incidents(limit: int = 100, authorization: str | None = Header(default=None)) -> dict[str, list[dict[str, Any]]]:
+    _authorize("read", authorization)
     bounded_limit = max(1, min(limit, 500))
     return {"incidents": [incident.model_dump(mode="json") for incident in manager.incidents.list(bounded_limit)]}
 
 
 @app.post("/api/replay/start")
-def start_replay(request: ReplayRequest) -> dict[str, str]:
+def start_replay(request: ReplayRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    _authorize("control", authorization)
     try:
         manager.start(request.scenario, request.speed)
     except (RuntimeError, FileNotFoundError) as exc:
@@ -322,13 +405,15 @@ def start_replay(request: ReplayRequest) -> dict[str, str]:
 
 
 @app.post("/api/replay/stop")
-def stop_replay() -> dict[str, str]:
+def stop_replay(authorization: str | None = Header(default=None)) -> dict[str, str]:
+    _authorize("control", authorization)
     manager.stop()
     return {"status": "stopped"}
 
 
 @app.post("/api/live/start")
-def start_live_capture(request: LiveCaptureRequest) -> dict[str, str]:
+def start_live_capture(request: LiveCaptureRequest, authorization: str | None = Header(default=None)) -> dict[str, str]:
+    _authorize("control", authorization)
     try:
         manager.start_live(request.interface, request.bpf_filter)
     except RuntimeError as exc:
@@ -338,6 +423,12 @@ def start_live_capture(request: LiveCaptureRequest) -> dict[str, str]:
 
 @app.websocket("/ws/alerts")
 async def alert_socket(websocket: WebSocket) -> None:
+    token = websocket.query_params.get("access_token")
+    try:
+        _authorize("read", f"Bearer {token}" if token else None)
+    except HTTPException:
+        await websocket.close(code=4401)
+        return
     await websocket.accept()
     subscription = manager.subscribe()
     try:
@@ -352,8 +443,9 @@ async def alert_socket(websocket: WebSocket) -> None:
 
 
 @app.get("/api/explain/{alert_id}")
-async def get_explanation(alert_id: str) -> dict[str, Any]:
+async def get_explanation(alert_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
     """Trigger and return an explanation for a single stored alert on demand."""
+    _authorize("read", authorization)
     alert = next((item for item in manager.alerts if item.alert_id == alert_id), None)
     if alert is None:
         raise HTTPException(status_code=404, detail="Alert not found")
@@ -373,12 +465,19 @@ async def get_explanation(alert_id: str) -> dict[str, Any]:
 
 
 explainer_task: asyncio.Task[None] | None = None
+ollama_status_task: asyncio.Task[None] | None = None
 
 
 async def startup() -> None:
     """Probe Ollama and start the asynchronous explanation worker."""
-    global explainer_task
-    manager.ollama_status["available"] = await check_ollama()
+    global explainer_task, explanation_loop, ollama_status_task
+    explanation_loop = asyncio.get_running_loop()
+    manager.ollama_status["available"] = await check_ollama(model=manager.ollama_status["model"])
+
+    async def refresh_ollama_status() -> None:
+        while True:
+            manager.ollama_status["available"] = await check_ollama(model=manager.ollama_status["model"])
+            await asyncio.sleep(10)
 
     async def on_explained(alert_id: str, result: Any) -> None:
         explanation, source = result.explanation, result.source
@@ -403,10 +502,11 @@ async def startup() -> None:
             await on_explained(alert.alert_id, result)
 
     explainer_task = asyncio.create_task(drain())
+    ollama_status_task = asyncio.create_task(refresh_ollama_status())
 
 
 async def shutdown() -> None:
-    global explainer_task
+    global explainer_task, explanation_loop, ollama_status_task
     if explainer_task is not None:
         explainer_task.cancel()
         try:
@@ -414,6 +514,14 @@ async def shutdown() -> None:
         except asyncio.CancelledError:
             pass
         explainer_task = None
+    if ollama_status_task is not None:
+        ollama_status_task.cancel()
+        try:
+            await ollama_status_task
+        except asyncio.CancelledError:
+            pass
+        ollama_status_task = None
+    explanation_loop = None
 
 
 def run() -> None:

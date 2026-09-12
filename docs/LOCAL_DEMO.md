@@ -44,6 +44,9 @@ docker compose up
 ```
 
 Open `http://localhost:5173`.
+The first startup downloads `qwen2.5:3b-instruct` into the persistent Ollama
+volume; later starts reuse that model. Set `OLLAMA_MODEL` before startup to use
+a different Ollama model.
 
 ## Demonstration flow
 
@@ -63,6 +66,7 @@ Open `http://localhost:5173`.
 
 - `GET /api/health`
 - `GET /api/scenarios`
+- `GET /api/live/interfaces`
 - `GET /api/metrics`
 - `GET /api/alerts?limit=100`
 - `POST /api/replay/start`
@@ -124,12 +128,13 @@ For collection attributes, permissions, and the server API key scope, see
 Detection remains local and deterministic. Ollama only turns an already-generated structured alert into a short analyst paragraph.
 
 ```bash
-# one-time model download
-ollama pull qwen2.5:3b-instruct
-# then start the API; the dashboard shows an Ollama chip when reachable
+# Docker Compose downloads the configured model automatically.
+docker compose up
 ```
 
-Defaults assume Ollama on the same host (`http://127.0.0.1:11434`, model `qwen2.5:3b-instruct`). Override with `OLLAMA_URL`, `OLLAMA_MODEL`, and `OLLAMA_TIMEOUT_SECONDS` in `.env`.
+Compose uses `http://ollama:11434`; a host-installed Ollama should use
+`http://127.0.0.1:11434`. Override with `OLLAMA_URL`, `OLLAMA_MODEL`, and
+`OLLAMA_TIMEOUT_SECONDS` in `.env`.
 
 Behavior:
 

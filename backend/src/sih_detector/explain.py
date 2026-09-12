@@ -99,15 +99,20 @@ async def generate_explanation(
 async def check_ollama(
     *,
     url: str = DEFAULT_OLLAMA_URL,
+    model: str = DEFAULT_MODEL,
     timeout_seconds: float = 2.0,
 ) -> bool:
-    """Lightweight reachability probe; never required for detection."""
+    """Check reachability and verify that the configured model is installed."""
     try:
         import httpx
 
         async with httpx.AsyncClient(timeout=timeout_seconds) as client:
             response = await client.get(f"{url}/api/tags")
-            return response.status_code == 200
+            if response.status_code != 200:
+                return False
+            payload = response.json()
+            models = payload.get("models", [])
+            return any(str(item.get("name", "")) in {model, f"{model}:latest"} for item in models)
     except Exception:
         return False
 

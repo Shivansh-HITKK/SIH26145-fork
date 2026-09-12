@@ -9,6 +9,11 @@ python -m pip install -e 'backend[live,ml]'
 ```
 
 Live capture usually requires packet-capture privileges. Only capture interfaces and traffic you are authorized to monitor.
+For a native Linux run, grant the process the required packet-capture capability
+or run it in an authorized capture environment. The default Docker Compose demo
+is intentionally not attached to the host network; use a separate deployment
+with explicit `CAP_NET_RAW`/libpcap access and an approved interface when live
+capture is required.
 
 ## Capture live metadata
 
@@ -103,7 +108,7 @@ perfectly to this project's taxonomy; the mapping is intentionally explicit in
 For threat-class classification, provide operator-labeled windows in JSONL. Each line must have this shape:
 
 ```json
-{"label":"benign","events":[{"timestamp":"2026-09-09T10:00:00Z","flow_id":"f-1","source_ip":"10.0.0.5","destination_ip":"1.1.1.1","source_port":42000,"destination_port":443,"protocol":"TCP","packets":4,"bytes":512,"direction":"outbound","connection_completed":true}]}
+{"label":"benign","capture_id":"capture-2026-09-09-a","events":[{"timestamp":"2026-09-09T10:00:00Z","flow_id":"f-1","source_ip":"10.0.0.5","destination_ip":"1.1.1.1","source_port":42000,"destination_port":443,"protocol":"TCP","packets":4,"bytes":512,"direction":"outbound","connection_completed":true}]}
 ```
 
 Supported labels are `benign`, `ddos`, `port_scanning`, `dns_tunnelling`, `dga`, `botnet_beaconing`, `encrypted_session_anomaly`, `data_exfiltration`, `udp_amplification`, and `slowloris`. Include multiple independent windows per class, including benign windows.
@@ -116,7 +121,7 @@ PYTHONPATH=backend/src python -m sih_detector.cli \
   --model-dir models
 ```
 
-The command writes `threat_classifier.joblib`, `anomaly_detector.joblib`, and `model_meta.json` with version `ml-real-v1`. Evaluation uses a contiguous per-class holdout rather than a random adjacent-flow split. The reported accuracy is only valid for the labeled capture distribution; it is not a universal production accuracy claim.
+The command writes `threat_classifier.joblib`, `anomaly_detector.joblib`, and `model_meta.json` with version `ml-real-v1`. Include the same `capture_id` on every window from one independent capture. When capture IDs are present, evaluation holds out complete capture groups so windows from one capture cannot appear in both training and evaluation. Older inputs without capture IDs use a contiguous per-class holdout. The metadata records the input SHA-256, feature schema version, row/event counts, label counts, group count, and evaluation method. The reported accuracy is only valid for the labeled capture distribution; it is not a universal production accuracy claim.
 
 ## Run the API in live mode
 
@@ -128,7 +133,12 @@ curl -X POST http://127.0.0.1:8000/api/live/start \
   -d '{"interface":"eth0","bpf_filter":"ip or ip6"}'
 ```
 
-The dashboard receives live alerts through `WS /ws/alerts`. Stop capture with:
+The dashboard discovers locally visible interfaces through
+`GET /api/live/interfaces` and sends both the selected interface and BPF filter
+to `POST /api/live/start`. Capture counters (`packets_seen`, `flows_emitted`,
+`dropped_packets`, and capture errors) are exposed in `/api/metrics` and the
+dashboard status strip. The dashboard receives live alerts through
+`WS /ws/alerts`. Stop capture with:
 
 ```bash
 curl -X POST http://127.0.0.1:8000/api/replay/stop

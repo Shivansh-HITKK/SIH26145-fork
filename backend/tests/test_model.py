@@ -107,6 +107,34 @@ def test_real_labeled_windows_train_classifier(tmp_path) -> None:
     result = train_from_labeled_jsonl(dataset, output_dir=tmp_path / "models")
     assert result["version"] == "ml-real-v1"
     assert (tmp_path / "models" / "model_meta.json").is_file()
+    metadata = json.loads((tmp_path / "models" / "model_meta.json").read_text(encoding="utf-8"))
+    assert metadata["feature_schema_version"] == "window-features-v1"
+    assert metadata["dataset_sha256"]
+    assert metadata["dataset_rows"] == 10
+    assert metadata["dataset_events"] == 100
+
+
+def test_real_training_holds_out_capture_groups(tmp_path) -> None:
+    dataset = tmp_path / "grouped-labeled.jsonl"
+    rows = []
+    for label in ("benign", "ddos"):
+        for group_index in range(4):
+            rows.append(
+                {
+                    "label": label,
+                    "capture_id": f"{label}-capture-{group_index}",
+                    "events": [event.model_dump(mode="json") for event in ddos_window()],
+                }
+            )
+    dataset.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
+
+    result = train_from_labeled_jsonl(dataset, output_dir=tmp_path / "models")
+    metadata = json.loads((tmp_path / "models" / "model_meta.json").read_text(encoding="utf-8"))
+
+    assert result["version"] == "ml-real-v1"
+    assert metadata["evaluation_method"] == "capture_group_holdout"
+    assert metadata["dataset_group_count"] == 8
+    assert metadata["dataset_rows"] == 8
 
 
 def test_unlabeled_live_events_train_anomaly_baseline(tmp_path) -> None:

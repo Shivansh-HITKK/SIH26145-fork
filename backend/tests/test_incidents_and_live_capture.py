@@ -1,3 +1,7 @@
+import os
+import socket
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -86,3 +90,107 @@ def test_tls_client_hello_derives_metadata_without_payload() -> None:
     assert event.tls_fingerprint
     assert event.tls_packet_sizes == [len(packet)]
     assert not hasattr(event, "payload")
+
+
+def test_flow_aggregator_merges_packets_and_flushes_on_tcp_close() -> None:
+    from sih_detector.live_capture import FlowAggregator
+    from sih_detector.schemas import FlowEvent
+
+    first = FlowEvent(
+        timestamp=BASE_TIME,
+        flow_id="packet-1",
+        source_ip="192.0.2.10",
+        destination_ip="192.0.2.20",
+        source_port=40000,
+        destination_port=443,
+        protocol="TCP",
+        packets=1,
+        bytes=60,
+        direction="outbound",
+        tcp_flags=["SYN"],
+        connection_completed=False,
+    )
+    last = first.model_copy(
+        update={
+            "timestamp": BASE_TIME + timedelta(seconds=1),
+            "flow_id": "packet-2",
+            "packets": 1,
+            "bytes": 80,
+            "tcp_flags": ["FIN"],
+            "connection_completed": True,
+        }
+    )
+
+    aggregator = FlowAggregator()
+    assert aggregator.push(first) == []
+    completed = aggregator.push(last)
+
+    assert len(completed) == 1
+    assert completed[0].flow_id == "packet-1"
+    assert completed[0].packets == 2
+    assert completed[0].bytes == 140
+    assert completed[0].tcp_flags == ["SYN", "FIN"]
+
+
+def test_flow_aggregator_flushes_idle_flows() -> None:
+    from sih_detector.live_capture import FlowAggregator
+    from sih_detector.schemas import FlowEvent
+
+    event = FlowEvent(
+        timestamp=BASE_TIME,
+        flow_id="udp-1",
+        source_ip="192.0.2.10",
+        destination_ip="192.0.2.20",
+        source_port=40000,
+        destination_port=53,
+        protocol="UDP",
+        packets=1,
+        bytes=100,
+    )
+    later = event.model_copy(update={"timestamp": BASE_TIME + timedelta(seconds=6), "flow_id": "udp-2"})
+
+    aggregator = FlowAggregator(idle_timeout_seconds=5)
+    assert aggregator.push(event) == []
+    completed = aggregator.push(later)
+
+    assert [flow.flow_id for flow in completed] == ["udp-1"]
+    assert aggregator.flush()[0].flow_id == "udp-2"
+
+
+@pytest.mark.skipif(
+    os.getenv("SIH_RUN_LIVE_CAPTURE_TEST") != "1",
+    reason="Set SIH_RUN_LIVE_CAPTURE_TEST=1 for an authorized local capture check",
+)
+def test_authorized_loopback_capture_emits_metadata_only() -> None:
+    pytest.importorskip("scapy.all")
+    from sih_detector.live_capture import capture_events
+
+    stop_event = threading.Event()
+    captured: list = []
+    capture_errors: list[Exception] = []
+
+    def collect() -> None:
+        try:
+            captured.extend(capture_events(stop_event, interface="lo", bpf_filter="udp and port 39099"))
+        except Exception as exc:
+            capture_errors.append(exc)
+
+    collector = threading.Thread(target=collect, daemon=True)
+    collector.start()
+    time.sleep(0.25)
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+            sender.sendto(b"authorized-local-test", ("127.0.0.1", 39099))
+    except PermissionError as exc:
+        stop_event.set()
+        collector.join(timeout=5)
+        pytest.skip(f"raw socket capture is unavailable in this environment: {exc}")
+    stop_event.set()
+    collector.join(timeout=5)
+
+    if capture_errors:
+        pytest.skip(f"live capture is unavailable in this environment: {capture_errors[0]}")
+
+    assert captured
+    assert sum(event.packets for event in captured) >= 1
+    assert all(not hasattr(event, "payload") for event in captured)
